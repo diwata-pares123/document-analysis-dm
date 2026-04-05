@@ -1,0 +1,13 @@
+# Ignore Environment Variables (Security)
+.env
+
+# Ignore Virtual Environments (Don't push heavy libraries)
+venv/
+env/
+.venv/
+
+# Ignore Python Cache (Hidden background files)
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
