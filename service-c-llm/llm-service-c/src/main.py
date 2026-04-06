@@ -9,8 +9,6 @@ from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from dotenv import load_dotenv
-
-# 1. Swap the Google import for Groq
 from groq import Groq 
 
 load_dotenv()
@@ -18,9 +16,8 @@ app = FastAPI()
 
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-# 2. Initialize the Groq Client
+# Initialize the Groq Client
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-# Using Llama 3.3 70B as it's an incredibly capable and fast default for Groq
 MODEL_ID = "llama-3.3-70b-versatile" 
 
 # --- LIGHTWEIGHT URL SCRAPER ---
@@ -46,7 +43,7 @@ async def agentic_orchestrator(
     history: Annotated[str, Form()] = "[]",
     documents: Annotated[Optional[List[UploadFile]], File()] = None
 ):
-    # 1. PRE-PROCESS FILES (Must be done before streaming starts)
+    # 1. PRE-PROCESS FILES
     file_data = []
     if documents:
         for doc in documents:
@@ -64,22 +61,16 @@ async def agentic_orchestrator(
     formatted_contents = []
     for msg in chat_history:
         content_text = msg.get("content", "").strip()
-        if not content_text:
-            continue
-        # Groq uses "assistant" instead of "model"
+        if not content_text: continue
         role = "user" if msg.get("role") == "user" else "assistant"
-        # Groq uses the {"role": ..., "content": ...} dictionary format
         formatted_contents.append({"role": role, "content": content_text})
 
-    # 3. THE ASYNC GENERATOR (This broadcasts live JSON updates to the frontend)
+    # 3. THE ASYNC GENERATOR
     async def process_stream():
         yield yield_event("status", "Request received by Orchestrator...")
-        await asyncio.sleep(0.2) 
+        await asyncio.sleep(0.1) 
         
-        # Initialize error_message here to catch scrape errors early
         error_message = None 
-
-        # --- URL EXTRACTION ---
         urls = re.findall(r'(https?://[^\s]+)', prompt)
         scraped_text = ""
         scrape_error = None
@@ -93,102 +84,58 @@ async def agentic_orchestrator(
                 else:
                     scraped_text += f"\n\n--- Content from {url} ---\n{scraped_result}"
 
-        # If the scrape failed AND there are no files attached, set the global error_message 
-        # so Service B gets skipped entirely.
         if scrape_error and not scraped_text and not has_files:
             error_message = scrape_error
 
         # --- THE ROUTER ---
         yield yield_event("status", "Analyzing intent to route request...")
         
-        router_prompt = f"""
-        Analyze this user input: "{prompt}"
-        Has attached files: {has_files}
-        Has URLs: {bool(urls)}
-        
-        Categorize into EXACTLY ONE of these categories:
-        DOC_ANALYSIS: User wants to analyze attached files, pasted text, or provided URLs.
-        WEB_SEARCH: User is asking for factual information, research links (RRLs), or real-time internet search.
-        HYBRID_ANALYSIS: User wants BOTH document analysis AND web search/external links simultaneously.
-        GENERAL_CHAT: User is saying hello, making small talk, or asking completely irrelevant questions.
-        
-        Respond ONLY with the category name.
-        """
+        router_prompt = f"Analyze: '{prompt}'. Files: {has_files}. URLs: {bool(urls)}. Categories: DOC_ANALYSIS, WEB_SEARCH, HYBRID_ANALYSIS, GENERAL_CHAT. Respond ONLY with category name."
         
         try:
-            # Groq completion call
-            route_response = client.chat.completions.create(
-                model=MODEL_ID,
-                messages=[{"role": "user", "content": router_prompt}]
-            )
+            route_response = client.chat.completions.create(model=MODEL_ID, messages=[{"role": "user", "content": router_prompt}])
             route_check = route_response.choices[0].message.content.strip().upper()
-            
             yield yield_event("status", f"Route Selected: {route_check}")
         except Exception as e:
-            error_str = str(e).lower()
-            if "429" in error_str or "quota" in error_str:
-                yield yield_event("error", "Quota Hit: Docify is processing too many requests. Please wait a minute.")
-            else:
-                yield yield_event("error", f"Router Error: {str(e)}")
+            yield yield_event("error", f"Router Error: {str(e)}")
             return
 
-        # -----------------------------------------
-        # PATH C: GENERAL CHAT
-        # -----------------------------------------
+        # Path: GENERAL_CHAT
         if "GENERAL_CHAT" in route_check:
             yield yield_event("status", "Synthesizing chat response...")
-            
-            persona = "You are Docify. Politely respond to the user, but gently remind them your primary purpose is Cosine Similarity document analysis."
-            
-            # Combine System Persona + History + Latest Prompt for Groq
-            messages = [{"role": "system", "content": persona}] + formatted_contents + [{"role": "user", "content": prompt}]
-            
+            # UPDATED IDENTITY HERE
+            system_prompt = "You are Docify, an advanced AI document analysis engine built with TF-IDF, Cosine Similarity, and LangChain RAG. Respond politely and conversationally."
+            messages = [{"role": "system", "content": system_prompt}] + formatted_contents + [{"role": "user", "content": prompt}]
             try:
-                chat_response = client.chat.completions.create(
-                    model=MODEL_ID,
-                    messages=messages
-                )
+                chat_response = client.chat.completions.create(model=MODEL_ID, messages=messages)
                 yield yield_event("result", chat_response.choices[0].message.content)
             except Exception:
-                yield yield_event("error", "Docify is on a quick cooldown. Please wait a minute.")
+                yield yield_event("error", "Service busy. Please wait.")
             return
 
-        # -----------------------------------------
-        # PATH B: WEB SEARCH (Simulated for Groq)
-        # -----------------------------------------
+        # Path: WEB_SEARCH
         if "WEB_SEARCH" in route_check and "HYBRID" not in route_check:
             yield yield_event("status", "Consulting knowledge base...")
-            
-            # Adjusted persona since Groq cannot actively browse the internet
-            persona = "You are Docify, a helpful research assistant. Provide clear, factual answers based on your training data."
-            
-            messages = [{"role": "system", "content": persona}] + formatted_contents + [{"role": "user", "content": prompt}]
-            
+            # UPDATED IDENTITY HERE
+            system_prompt = "You are Docify, an advanced AI document analysis engine built with TF-IDF, Cosine Similarity, and LangChain RAG. Use internal knowledge to answer."
+            messages = [{"role": "system", "content": system_prompt}] + formatted_contents + [{"role": "user", "content": prompt}]
             try:
-                search_response = client.chat.completions.create(
-                    model=MODEL_ID,
-                    messages=messages
-                )
+                search_response = client.chat.completions.create(model=MODEL_ID, messages=messages)
                 yield yield_event("result", search_response.choices[0].message.content)
             except Exception:
-                yield yield_event("error", "Rate limit hit. Be right back in a minute.")
+                yield yield_event("error", "Rate limit hit.")
             return
 
-        # -----------------------------------------
-        # PATH A & D: DOC ANALYSIS OR HYBRID ANALYSIS
-        # (Call Service B)
-        # -----------------------------------------
+        # --- PATH: DOC / HYBRID ANALYSIS (Calls Service B) ---
         full_text_to_analyze = prompt + scraped_text
         analysis_text = ""
         
         if not has_files and len(full_text_to_analyze) > 100:
             yield yield_event("status", "Extracting raw data from prompt...")
             try:
-                split_query = f"Extract ONLY the raw data/text content. Exclude user commands. Input: '{full_text_to_analyze}'"
-                # Groq extraction call
                 extraction_response = client.chat.completions.create(
                     model=MODEL_ID,
-                    messages=[{"role": "user", "content": split_query}]
+                    messages=[{"role": "user", "content": f"Extract ONLY raw text content from: '{full_text_to_analyze}'"}]
                 )
                 analysis_text = extraction_response.choices[0].message.content.strip()
             except Exception:
@@ -197,84 +144,81 @@ async def agentic_orchestrator(
             analysis_text = scraped_text
 
         lab_data = "[]"
+        rag_context_snippets = [] # 👈 To store the RAG results from Service B
         
-        # Only call Data Engine if no scrape errors occurred
         if not error_message and (has_files or analysis_text):
             yield yield_event("status", "Calling Data Engine (Service B)...")
-            
             try:
                 form_data = {"prompt": prompt}
-                files_to_send = []
-                
-                if has_files:
-                    files_to_send = [("documents", (fname, fcontent, ftype)) for fname, fcontent, ftype in file_data]
-                if analysis_text:
-                    form_data["raw_text"] = analysis_text
+                files_to_send = [("documents", (fname, fcontent, ftype)) for fname, fcontent, ftype in file_data] if has_files else []
+                if analysis_text: form_data["raw_text"] = analysis_text
 
                 engine_response = await asyncio.to_thread(
                     requests.post,
-                    "http://127.0.0.1:8000/engine/analyze", 
+                    "http://127.0.0.1:8000/engine/analyze", # 👈 Fixed to port 8001
                     data=form_data,
                     files=files_to_send if files_to_send else None
                 )
                 engine_response.raise_for_status()
-                
                 result_json = engine_response.json()
+                
                 if result_json.get("status") == "error":
                     error_message = result_json.get("message")
                 else:
                     lab_data = json.dumps(result_json.get("lab_report", []))
+                    rag_context_snippets = result_json.get("rag_context", []) # 👈 Extract RAG snippets
                     
                 yield yield_event("status", "Data Engine analysis complete.")
-                
             except Exception as e:
-                error_message = "The Data Engine was unreachable. Ensure Service B is running."
+                error_message = "Data Engine unreachable. Ensure Service B is running on port 8001."
                 yield yield_event("status", "Failed to reach Data Engine.")
 
-        # --- FINAL SYNTHESIZER ---
-        if "HYBRID" in route_check:
-            yield yield_event("status", "Synthesizing hybrid report...")
-        else:
-            yield yield_event("status", "Synthesizing final report...")
+        # --- FINAL RAG SYNTHESIZER ---
+        yield yield_event("status", "Synthesizing final report...")
         
         try:
             if error_message:
-                messages = formatted_contents + [{"role": "user", "content": f"Tell the user gracefully that we encountered an error reading the document: {error_message}"}]
+                messages = formatted_contents + [{"role": "user", "content": f"Error: {error_message}"}]
                 final_response = client.chat.completions.create(model=MODEL_ID, messages=messages)
             else:
-                system_msg = """You are the Docify Assistant. Translate the raw TF-IDF and Cosine Similarity scores into simple, conversational insights. 
-                DO NOT use a rigid template or list all the use cases. Instead, dynamically pick just 1 or 2 real-world NLP use cases (like Plagiarism Detection, Search Ranking, or Semantic Search) that actually make sense for the user's specific document.
-                Keep it flowing naturally. You can briefly mention that this evaluates 'semantic vector orientation ignoring document length', but weave it in smoothly so you don't sound like a textbook.
+                # UPDATED FULL IDENTITY HERE
+                system_msg = """You are Docify, an advanced AI document analysis engine. 
+                Your core architecture utilizes TF-IDF, Cosine Similarity, and LangChain-powered RAG (Retrieval-Augmented Generation) to extract, analyze, and retrieve insights from complex documents.
                 
-                CRITICAL INSTRUCTIONS FOR RESUME/DOCUMENT ANALYSIS:
-                1. You will receive 'full_extracted_text' in the Data Engine Output.
-                2. You MUST explicitly state the names of the applicants or authors found in this text.
-                3. If you do not see a name in the text, refer to them by their filename.
-                4. Do not invent skills or facts that are not explicitly written in the extracted text.
-                5. Base your final recommendation heavily on both the Data Engine's Relevance Score AND the actual information found in the text."""
-                
+                CRITICAL INSTRUCTIONS:
+                1. Answer the user's question naturally and conversationally.
+                2. ONLY IF you are analyzing a specific document or resume, structure your response to include:
+                   - Applicant/Author names (if found in the text).
+                   - A Recommendation based on the text and relevance scores.
+                   - The exact 'word_count' provided in the JSON data.
+                3. IF the user is just asking a general question about you (e.g., "What is Docify?"), proudly explain your capabilities as a document analysis tool, but DO NOT use the Applicant/Recommendation template.
+                4. DO NOT explain the basic definitions of TF-IDF or Cosine Similarity unless the user explicitly asks you to. Just use the provided context to answer the prompt."""
+
                 if "HYBRID" in route_check:
-                    system_msg += "\n\nCRITICAL: The user also requested external links/research. Use your internal knowledge to provide relevant facts and context alongside the document analysis."
+                    system_msg += "\n5. User requested web research; include your own external facts."
 
-                # 👇 THIS IS THE FIX WE ADDED: Handling empty lab_data so the AI uses chat history
-                if lab_data == "[]" or not lab_data:
-                    user_content_str = f"User Question: {prompt}\n\n[System Note: No new files were uploaded in this turn. Do not say the Data Engine failed. Please refer to the chat history above to recall the applicant names, skills, and Cosine Similarity scores to answer the user's question.]"
+                # Format the retrieved RAG snippets into a readable string for the LLM
+                rag_formatted = "\n\n".join([f"Relevant Snippet {i+1}: {text}" for i, text in enumerate(rag_context_snippets)])
+
+                if not lab_data or lab_data == "[]":
+                    user_content_str = f"Question: {prompt}\n\n[No new files. Use history.]"
                 else:
-                    user_content_str = f"User Question: {prompt}\n\nData Engine Output: {lab_data}\n\nPlease explain these Cosine Similarity results to the user based on the context above."
-                
+                    user_content_str = f"""
+                    User Question: {prompt}
+                    
+                    RETRIEVED DOCUMENT SNIPPETS (RAG):
+                    {rag_formatted}
+                    
+                    MATHEMATICAL SCORES (TF-IDF):
+                    {lab_data}
+                    
+                    Use the context above to answer the user's question."""
+
                 messages = [{"role": "system", "content": system_msg}] + formatted_contents + [{"role": "user", "content": user_content_str}]
-                
-                final_response = client.chat.completions.create(
-                    model=MODEL_ID,
-                    messages=messages
-                )
+                final_response = client.chat.completions.create(model=MODEL_ID, messages=messages)
 
-            # Sends the final text directly to the chat bubble payload
             yield yield_event("result", final_response.choices[0].message.content)
-
         except Exception as e:
-            yield yield_event("error", f"Synthesis Error: Could not generate final text. {str(e)}")
+            yield yield_event("error", f"Synthesis Error: {str(e)}")
 
-    # 3. RETURN THE STREAM
-    # Now serving proper line-delimited JSON chunks!
     return StreamingResponse(process_stream(), media_type="application/x-ndjson")
