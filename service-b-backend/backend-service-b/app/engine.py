@@ -4,7 +4,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 # --- NEW IMPORTS FOR RAG ---
 # UPDATED: Using the new langchain_text_splitters package
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 
 # =================================================================

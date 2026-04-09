@@ -1,5 +1,5 @@
 import React, { useState, useRef } from 'react';
-import { PlusCircle, Send, FileText, Link2, X, Image as ImageIcon, Loader2 } from 'lucide-react';
+import { PlusCircle, Send, FileText, Link2, X, Image as ImageIcon, Loader2, Download } from 'lucide-react';
 import ReactMarkdown from 'react-markdown'; 
 
 const promptChips = [
@@ -32,6 +32,69 @@ function ChatWorkspace() {
   
   const fileInputRef = useRef(null);
   const abortControllerRef = useRef(null);
+
+  // --- UPDATED PDF LOGIC ---
+  const handleDownloadPDF = async (aiMsgId) => {
+    try {
+      const module = await import('jspdf');
+      const jsPDF = module.default || module.jsPDF;
+      const doc = new jsPDF();
+      
+      // 1. Find the specific AI message the user clicked on
+      const targetIndex = messages.findIndex(m => m.id === aiMsgId);
+      if (targetIndex === -1) return;
+      
+      const aiMsg = messages[targetIndex];
+      
+      // 2. Find the User prompt that came right before it
+      const userMsg = targetIndex > 0 && messages[targetIndex - 1].role === 'user' 
+        ? messages[targetIndex - 1] 
+        : null;
+
+      // 3. Put only those two messages in the PDF
+      const msgsToPrint = [];
+      if (userMsg) msgsToPrint.push(userMsg);
+      msgsToPrint.push(aiMsg);
+      
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(18);
+      doc.text("Docify AI Analysis Report", 20, 20);
+      doc.setFontSize(10);
+      doc.setFont("helvetica", "normal");
+      doc.text(`Generated on: ${new Date().toLocaleString()}`, 20, 28);
+      
+      let yOffset = 40;
+      const pageHeight = doc.internal.pageSize.height;
+
+      msgsToPrint.forEach((msg) => {
+        if (!msg.content) return;
+        
+        doc.setFont("helvetica", "bold");
+        doc.text(msg.role === 'user' ? "User Query:" : "Docify Engine:", 20, yOffset);
+        yOffset += 6;
+        
+        doc.setFont("helvetica", "normal");
+        const cleanText = msg.content.replace(/[*#`]/g, ''); 
+        const splitText = doc.splitTextToSize(cleanText, 170);
+        
+        splitText.forEach(line => {
+          if (yOffset > pageHeight - 20) {
+            doc.addPage();
+            yOffset = 20;
+          }
+          doc.text(line, 20, yOffset);
+          yOffset += 6;
+        });
+        yOffset += 8; 
+      });
+      
+      doc.save(`Docify_Analysis_${Date.now()}.pdf`);
+    } catch (err) {
+      console.error("PDF generation failed:", err);
+      setErrorMsg("Failed to generate PDF. Make sure jsPDF is installed (npm install jspdf)");
+      setTimeout(() => setErrorMsg(null), 3000);
+    }
+  };
 
   const handleMenuClick = (fileTypeStr) => {
     setIsMenuOpen(false); 
@@ -102,8 +165,8 @@ function ChatWorkspace() {
       files: [...attachments] 
     };
     
-    // Extract history before adding the new message so backend gets proper context
     const historyToPass = messages.map(m => ({ role: m.role, content: m.content }));
+    const hasAttachments = attachments.length > 0;
     
     setMessages((prev) => [...prev, newMsg]);
     setInputText("");
@@ -115,7 +178,7 @@ function ChatWorkspace() {
 
     const formData = new FormData();
     formData.append("prompt", newMsg.content);
-    formData.append("history", JSON.stringify(historyToPass)); // Added memory payload
+    formData.append("history", JSON.stringify(historyToPass)); 
     
     newMsg.files.forEach((fileObj) => {
       formData.append("documents", fileObj.originalFile); 
@@ -125,7 +188,8 @@ function ChatWorkspace() {
     setMessages((prev) => [...prev, { 
       id: botMsgId,
       role: 'assistant', 
-      content: "" // Starts empty until the final result arrives
+      content: "",
+      isAnalysis: hasAttachments
     }]);
 
     try {
@@ -147,16 +211,24 @@ function ChatWorkspace() {
 
         buffer += decoder.decode(value, { stream: true });
         const lines = buffer.split("\n");
-        buffer = lines.pop(); // Keep any incomplete JSON chunk in the buffer
+        buffer = lines.pop(); 
 
         for (const line of lines) {
           if (line.trim()) {
             try {
               const parsed = JSON.parse(line);
+              
               if (parsed.type === "status") {
-                setAgentStatus(parsed.message); // Update UI spinner text
+                setAgentStatus(parsed.message); 
+                
+                const analysisTriggers = ["Calling Data Engine", "Extracting raw data", "Extracting content"];
+                if (analysisTriggers.some(t => parsed.message.includes(t))) {
+                  setMessages((prev) => prev.map(msg => 
+                    msg.id === botMsgId ? { ...msg, isAnalysis: true } : msg
+                  ));
+                }
+
               } else if (parsed.type === "result" || parsed.type === "error") {
-                // Populate the chat bubble when the final response arrives
                 setMessages((prev) => prev.map(msg => 
                   msg.id === botMsgId ? { ...msg, content: parsed.message } : msg
                 ));
@@ -168,7 +240,6 @@ function ChatWorkspace() {
         }
       }
 
-      // Handle any remaining buffer
       if (buffer.trim()) {
         try {
           const parsed = JSON.parse(buffer);
@@ -186,9 +257,8 @@ function ChatWorkspace() {
             msg.id === botMsgId ? { ...msg, content: "🛑 **Cancelled:** The generation was stopped by the user." } : msg
         ));
       } else {
-        console.error(error);
         setMessages((prev) => prev.map(msg => 
-            msg.id === botMsgId ? { ...msg, content: "⚠️ **System Offline:** The Python backend is currently unreachable. Please make sure Service B/C is running." } : msg
+            msg.id === botMsgId ? { ...msg, content: "⚠️ **System Offline:** The Python backend is currently unreachable." } : msg
         ));
       }
     } finally {
@@ -212,7 +282,7 @@ function ChatWorkspace() {
           </div>
           DOCIFY
         </h1>
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-4">
           <div className="w-9 h-9 rounded-full bg-gradient-to-tr from-blue-600 to-indigo-500 border-2 border-gray-800 shadow-lg" />
         </div>
       </header>
@@ -246,7 +316,6 @@ function ChatWorkspace() {
         ) : (
           <div className="w-full max-w-3xl flex flex-col gap-6 pb-20">
             {messages.map((msg) => {
-              // Hide empty assistant bubbles while generating
               if (msg.role === 'assistant' && !msg.content) return null;
               
               return (
@@ -269,7 +338,21 @@ function ChatWorkspace() {
                     : 'bg-[#1b212b] text-gray-200 border border-gray-800 rounded-bl-sm prose prose-invert max-w-none'
                   }`}>
                     {msg.role === 'assistant' ? (
-                      <ReactMarkdown>{msg.content}</ReactMarkdown>
+                      <>
+                        <ReactMarkdown>{msg.content}</ReactMarkdown>
+                        {msg.isAnalysis && (
+                          <div className="mt-3 pt-3 border-t border-gray-800 flex justify-end">
+                             {/* UPDATED BUTTON: PASSING msg.id INSTEAD OF msg.content */}
+                             <button 
+                               onClick={() => handleDownloadPDF(msg.id)}
+                               className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold bg-gray-800/50 hover:bg-blue-600/20 text-gray-400 hover:text-blue-400 border border-gray-700 hover:border-blue-500/50 rounded-lg transition-all cursor-pointer shadow-sm"
+                             >
+                               <Download className="w-3.5 h-3.5" />
+                               Download Report
+                             </button>
+                          </div>
+                        )}
+                      </>
                     ) : (
                       msg.content
                     )}

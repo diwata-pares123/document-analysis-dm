@@ -20,9 +20,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 MODEL_ID = "llama-3.3-70b-versatile" 
 
-# --- LIGHTWEIGHT URL SCRAPER ---
 def scrape_url(url: str) -> str:
-    """Fetches text from a given URL so Service B doesn't get garbage data."""
     try:
         headers = {"User-Agent": "Mozilla/5.0"}
         response = requests.get(url, headers=headers, timeout=10)
@@ -33,9 +31,18 @@ def scrape_url(url: str) -> str:
     except Exception as e:
         return f"[System Note: Could not extract data from {url}]"
 
-def yield_event(event_type: str, message: str) -> str:
-    """Helper to format JSON-line streams for the frontend."""
-    return json.dumps({"type": event_type, "message": message}) + "\n"
+def yield_event(event_type: str, message: str, trigger_pdf: bool = False) -> str:
+    return json.dumps({"type": event_type, "message": message, "trigger_pdf": trigger_pdf}) + "\n"
+
+# --- FIXED 1: AI IS NO LONGER IN CHARGE OF PDFS ---
+# We use a strict keyword check on the USER'S prompt. No AI hallucination possible.
+def check_pdf_intent(user_prompt: str) -> bool:
+    prompt_lower = user_prompt.lower()
+    pdf_keywords = [
+        "download pdf", "export pdf", "generate pdf", "make a pdf", 
+        "download report", "export report", "create pdf"
+    ]
+    return any(kw in prompt_lower for kw in pdf_keywords)
 
 @app.post("/api/analyze")
 async def agentic_orchestrator(
@@ -43,7 +50,9 @@ async def agentic_orchestrator(
     history: Annotated[str, Form()] = "[]",
     documents: Annotated[Optional[List[UploadFile]], File()] = None
 ):
-    # 1. PRE-PROCESS FILES
+    # Lock in the PDF decision immediately based on the user's prompt
+    should_trigger_pdf = check_pdf_intent(prompt)
+
     file_data = []
     if documents:
         for doc in documents:
@@ -52,7 +61,6 @@ async def agentic_orchestrator(
                 file_data.append((doc.filename, content, doc.content_type))
     has_files = len(file_data) > 0
 
-    # 2. PARSE CHAT HISTORY FOR MEMORY
     try:
         chat_history = json.loads(history)
     except:
@@ -65,7 +73,6 @@ async def agentic_orchestrator(
         role = "user" if msg.get("role") == "user" else "assistant"
         formatted_contents.append({"role": role, "content": content_text})
 
-    # 3. THE ASYNC GENERATOR
     async def process_stream():
         yield yield_event("status", "Request received by Orchestrator...")
         await asyncio.sleep(0.1) 
@@ -87,9 +94,7 @@ async def agentic_orchestrator(
         if scrape_error and not scraped_text and not has_files:
             error_message = scrape_error
 
-        # --- THE ROUTER ---
         yield yield_event("status", "Analyzing intent to route request...")
-        
         router_prompt = f"Analyze: '{prompt}'. Files: {has_files}. URLs: {bool(urls)}. Categories: DOC_ANALYSIS, WEB_SEARCH, HYBRID_ANALYSIS, GENERAL_CHAT. Respond ONLY with category name."
         
         try:
@@ -100,33 +105,30 @@ async def agentic_orchestrator(
             yield yield_event("error", f"Router Error: {str(e)}")
             return
 
-        # Path: GENERAL_CHAT
         if "GENERAL_CHAT" in route_check:
             yield yield_event("status", "Synthesizing chat response...")
-            # UPDATED IDENTITY HERE
-            system_prompt = "You are Docify, an advanced AI document analysis engine built with TF-IDF, Cosine Similarity, and LangChain RAG. Respond politely and conversationally."
+            system_prompt = "You are Docify, an advanced AI document analysis engine. Respond politely, organically, and conversationally."
             messages = [{"role": "system", "content": system_prompt}] + formatted_contents + [{"role": "user", "content": prompt}]
             try:
                 chat_response = client.chat.completions.create(model=MODEL_ID, messages=messages)
-                yield yield_event("result", chat_response.choices[0].message.content)
+                final_text = chat_response.choices[0].message.content
+                yield yield_event("result", final_text, should_trigger_pdf)
             except Exception:
                 yield yield_event("error", "Service busy. Please wait.")
             return
 
-        # Path: WEB_SEARCH
         if "WEB_SEARCH" in route_check and "HYBRID" not in route_check:
             yield yield_event("status", "Consulting knowledge base...")
-            # UPDATED IDENTITY HERE
-            system_prompt = "You are Docify, an advanced AI document analysis engine built with TF-IDF, Cosine Similarity, and LangChain RAG. Use internal knowledge to answer."
+            system_prompt = "You are Docify, an advanced AI document analysis engine. Use internal knowledge to answer naturally."
             messages = [{"role": "system", "content": system_prompt}] + formatted_contents + [{"role": "user", "content": prompt}]
             try:
                 search_response = client.chat.completions.create(model=MODEL_ID, messages=messages)
-                yield yield_event("result", search_response.choices[0].message.content)
+                final_text = search_response.choices[0].message.content
+                yield yield_event("result", final_text, should_trigger_pdf)
             except Exception:
                 yield yield_event("error", "Rate limit hit.")
             return
 
-        # --- PATH: DOC / HYBRID ANALYSIS (Calls Service B) ---
         full_text_to_analyze = prompt + scraped_text
         analysis_text = ""
         
@@ -144,7 +146,7 @@ async def agentic_orchestrator(
             analysis_text = scraped_text
 
         lab_data = "[]"
-        rag_context_snippets = [] # 👈 To store the RAG results from Service B
+        rag_context_snippets = [] 
         
         if not error_message and (has_files or analysis_text):
             yield yield_event("status", "Calling Data Engine (Service B)...")
@@ -155,7 +157,7 @@ async def agentic_orchestrator(
 
                 engine_response = await asyncio.to_thread(
                     requests.post,
-                    "http://127.0.0.1:8000/engine/analyze", # 👈 Fixed to port 8001
+                    "http://127.0.0.1:8000/engine/analyze",
                     data=form_data,
                     files=files_to_send if files_to_send else None
                 )
@@ -166,58 +168,45 @@ async def agentic_orchestrator(
                     error_message = result_json.get("message")
                 else:
                     lab_data = json.dumps(result_json.get("lab_report", []))
-                    rag_context_snippets = result_json.get("rag_context", []) # 👈 Extract RAG snippets
+                    rag_context_snippets = result_json.get("rag_context", []) 
                     
                 yield yield_event("status", "Data Engine analysis complete.")
             except Exception as e:
-                error_message = "Data Engine unreachable. Ensure Service B is running on port 8001."
+                error_message = "Data Engine unreachable. Ensure Service B is running on port 8000."
                 yield yield_event("status", "Failed to reach Data Engine.")
 
-        # --- FINAL RAG SYNTHESIZER ---
         yield yield_event("status", "Synthesizing final report...")
         
         try:
             if error_message:
                 messages = formatted_contents + [{"role": "user", "content": f"Error: {error_message}"}]
                 final_response = client.chat.completions.create(model=MODEL_ID, messages=messages)
+                final_text = final_response.choices[0].message.content
             else:
-                # UPDATED FULL IDENTITY HERE
+                # --- FIXED 2: REMOVED RIGID TEMPLATE INSTRUCTIONS ---
                 system_msg = """You are Docify, an advanced AI document analysis engine. 
-                Your core architecture utilizes TF-IDF, Cosine Similarity, and LangChain-powered RAG (Retrieval-Augmented Generation) to extract, analyze, and retrieve insights from complex documents.
+                Your core architecture utilizes TF-IDF, Cosine Similarity, and LangChain-powered RAG to extract and analyze insights.
                 
                 CRITICAL INSTRUCTIONS:
-                1. Answer the user's question naturally and conversationally.
-                2. ONLY IF you are analyzing a specific document or resume, structure your response to include:
-                   - Applicant/Author names (if found in the text).
-                   - A Recommendation based on the text and relevance scores.
-                   - The exact 'word_count' provided in the JSON data.
-                3. IF the user is just asking a general question about you (e.g., "What is Docify?"), proudly explain your capabilities as a document analysis tool, but DO NOT use the Applicant/Recommendation template.
-                4. DO NOT explain the basic definitions of TF-IDF or Cosine Similarity unless the user explicitly asks you to. Just use the provided context to answer the prompt."""
+                1. Answer the user's question naturally and directly based on the provided context.
+                2. DO NOT use a universal template, rigid structure, or forced formatting. Adapt your response organically to best answer the specific query without forcing sections like 'Authors' or 'Word counts' unless requested.
+                3. DO NOT explain definitions of TF-IDF unless explicitly asked."""
 
                 if "HYBRID" in route_check:
-                    system_msg += "\n5. User requested web research; include your own external facts."
+                    system_msg += "\n4. User requested web research; include your own external facts organically."
 
-                # Format the retrieved RAG snippets into a readable string for the LLM
                 rag_formatted = "\n\n".join([f"Relevant Snippet {i+1}: {text}" for i, text in enumerate(rag_context_snippets)])
 
                 if not lab_data or lab_data == "[]":
                     user_content_str = f"Question: {prompt}\n\n[No new files. Use history.]"
                 else:
-                    user_content_str = f"""
-                    User Question: {prompt}
-                    
-                    RETRIEVED DOCUMENT SNIPPETS (RAG):
-                    {rag_formatted}
-                    
-                    MATHEMATICAL SCORES (TF-IDF):
-                    {lab_data}
-                    
-                    Use the context above to answer the user's question."""
+                    user_content_str = f"User Question: {prompt}\n\nRETRIEVED DOCUMENT SNIPPETS (RAG):\n{rag_formatted}\n\nMATHEMATICAL SCORES (TF-IDF):\n{lab_data}\n\nUse the context above to answer naturally."
 
                 messages = [{"role": "system", "content": system_msg}] + formatted_contents + [{"role": "user", "content": user_content_str}]
                 final_response = client.chat.completions.create(model=MODEL_ID, messages=messages)
+                final_text = final_response.choices[0].message.content
 
-            yield yield_event("result", final_response.choices[0].message.content)
+            yield yield_event("result", final_text, should_trigger_pdf)
         except Exception as e:
             yield yield_event("error", f"Synthesis Error: {str(e)}")
 
